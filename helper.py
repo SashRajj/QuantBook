@@ -216,19 +216,25 @@ def quick_weights(signal_df, dollar_neutral=True, long_only=False,
 # Performance and risk statistics
 # ---------------------------------------------------------------------------
 
-def stats(port_ret, weights=None, benchmark=None, plot=True):
-    """Headline performance stats with an optional alpha/beta regression."""
+def stats(port_ret, weights=None, benchmark=None, plot=True, periods_per_year=252):
+    """
+    Headline performance stats with an optional alpha/beta regression.
+
+    `periods_per_year` controls the annualisation factor: 252 for daily
+    equity returns, 365 for daily crypto.
+    """
     cum = (1 + port_ret).cumprod()
     peak = cum.cummax()
     dd = (cum - peak) / peak
 
     sigma = port_ret.std()
-    sharpe = round(port_ret.mean() / sigma * np.sqrt(252), 3) if sigma > 0 else np.nan
+    ppy = periods_per_year
+    sharpe = round(port_ret.mean() / sigma * np.sqrt(ppy), 3) if sigma > 0 else np.nan
     t_stat = round(port_ret.mean() / (sigma / np.sqrt(len(port_ret))), 3) if sigma > 0 else np.nan
 
     s = {
-        "mean_return_annual": f"{port_ret.mean() * 252 * 100:.2f}%",
-        "volatility_annual": f"{port_ret.std() * np.sqrt(252) * 100:.2f}%",
+        "mean_return_annual": f"{port_ret.mean() * ppy * 100:.2f}%",
+        "volatility_annual": f"{port_ret.std() * np.sqrt(ppy) * 100:.2f}%",
         "sharpe": sharpe,
         "t_stat": t_stat,
         "max_drawdown": f"{dd.min() * 100:.2f}%",
@@ -240,7 +246,7 @@ def stats(port_ret, weights=None, benchmark=None, plot=True):
         df = pd.concat([port_ret, benchmark], axis=1).dropna()
         X = sm.add_constant(df.iloc[:, 1])
         model = sm.OLS(df.iloc[:, 0], X).fit()
-        s["alpha_annual"] = f"{model.params.iloc[0] * 252 * 100:.2f}%"
+        s["alpha_annual"] = f"{model.params.iloc[0] * ppy * 100:.2f}%"
         s["alpha_tstat"] = round(model.tvalues.iloc[0], 3)
         s["beta"] = round(model.params.iloc[1], 3)
 
