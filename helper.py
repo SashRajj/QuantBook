@@ -1,12 +1,4 @@
-"""
-Utilities for signal evaluation, portfolio construction, and risk analysis.
-
-The Optimizer is a per-date mean-variance program with optional dollar
-neutrality, position limits, leverage cap, transaction-cost penalty,
-and ex-post volatility scaling. Helpers cover information coefficient,
-return statistics, factor neutralization, distribution diagnostics,
-value-at-risk, and walk-forward splits.
-"""
+"""Signal evaluation, portfolio construction, and risk diagnostics."""
 
 import numpy as np
 import pandas as pd
@@ -25,12 +17,9 @@ class Optimizer:
     """
     Per-date mean-variance optimization.
 
-    Signals are first cross-sectionally rank-normalized to remove scale
-    differences across days, then standardized so the optimizer sees a
-    stable alpha distribution. Covariance is estimated once over the
-    training panel using Ledoit-Wolf shrinkage; this is sufficient for
-    a daily-rebalanced cross-sectional strategy and avoids the noise
-    that comes with naive sample covariance on hundreds of names.
+    Signals are cross-sectionally rank-normalized then standardized.
+    Covariance is estimated once on the training panel with Ledoit-Wolf
+    shrinkage.
     """
 
     def __init__(self, signal_df, returns_df):
@@ -50,20 +39,13 @@ class Optimizer:
             max_position=None, long_only=False, max_leverage=None,
             target_vol=None, tcost_penalty_bps=0, subsample=1, verbose=False):
         """
-        Run the per-date optimisation.
+        Solve the per-date QP and return a weights DataFrame.
 
-        The cvxpy problem is built once with `cp.Parameter` for alpha (and
-        previous weights, if a turnover penalty is on); the loop only
-        updates parameter values and re-solves with warm-starting. This
-        avoids the per-date canonicalisation overhead.
-
-        `tcost_penalty_bps` adds an L1 turnover penalty inside the
-        objective. It defaults to zero because realised transaction costs
-        are already subtracted in `port_ret`; turning it on stabilises
-        weights at the cost of a much slower solve (the L1 reformulation
-        adds n auxiliary variables). `subsample=k` skips k-1 dates
-        between solves and forward-fills weights, which is useful for
-        quick exploration when daily resolution is not needed.
+        The cvxpy problem is built once with `cp.Parameter` for alpha and
+        previous weights; the date loop only updates parameter values and
+        re-solves with warm-starting. `tcost_penalty_bps` adds an L1
+        turnover penalty inside the objective; `subsample=k` solves every
+        k-th date and forward-fills weights in between.
         """
         if long_only and dollar_neutral:
             raise ValueError("long_only=True is incompatible with dollar_neutral=True")
@@ -103,27 +85,27 @@ class Optimizer:
             alpha = self.alpha_df.loc[date].values.astype(float)
             if np.any(np.isnan(alpha)) or np.sum(np.abs(alpha)) == 0:
                 continue
+            alpha_p.value = alpha
+            if w_prev_p is not None:
+                w_prev_p.value = w_old
             try:
-                alpha_p.value = alpha
-                if w_prev_p is not None:
-                    w_prev_p.value = w_old
                 prob.solve(solver=cp.SCS, verbose=False, warm_start=True)
-                if w.value is None:
-                    continue
-                w_old = np.asarray(w.value).flatten()
-                if fully_invested:
-                    s = np.sum(np.abs(w_old))
-                    if s > 0:
-                        w_old = w_old / s
-                if target_vol:
-                    port_vol = np.sqrt(w_old @ self.cov @ w_old) * np.sqrt(252)
-                    if port_vol > 0:
-                        w_old = w_old * (target_vol / port_vol)
-                weights[date] = pd.Series(w_old, index=self.alpha_df.columns)
-                if verbose and (i + 1) % 200 == 0:
-                    print(f"  solved {i+1}/{len(dates)}")
-            except Exception:
+            except cp.SolverError:
                 continue
+            if w.value is None:
+                continue
+            w_old = np.asarray(w.value).flatten()
+            if fully_invested:
+                s = np.sum(np.abs(w_old))
+                if s > 0:
+                    w_old = w_old / s
+            if target_vol:
+                port_vol = np.sqrt(w_old @ self.cov @ w_old) * np.sqrt(252)
+                if port_vol > 0:
+                    w_old = w_old * (target_vol / port_vol)
+            weights[date] = pd.Series(w_old, index=self.alpha_df.columns)
+            if verbose and (i + 1) % 200 == 0:
+                print(f"  solved {i+1}/{len(dates)}")
 
         out = pd.DataFrame(weights).T
         if subsample > 1 and len(out) > 0:
@@ -146,13 +128,7 @@ def port_ret(weights_df, returns_df, tcost_bps=0):
 
 def quick_weights(signal_df, dollar_neutral=True, long_only=False,
                   fully_invested=True, max_position=None):
-    """
-    Rank-based weights without optimization.
-
-    Useful as a sanity check before running the optimizer: if a signal
-    cannot make money under simple rank weights, the optimizer is
-    unlikely to rescue it.
-    """
+    """Rank-based weights with no optimization. Used as a sanity check."""
     if long_only and dollar_neutral:
         raise ValueError("long_only=True is incompatible with dollar_neutral=True")
 
@@ -173,10 +149,7 @@ def quick_weights(signal_df, dollar_neutral=True, long_only=False,
 # ---------------------------------------------------------------------------
 
 def stats(port_ret, weights=None, benchmark=None, plot=True):
-    """
-    Headline performance statistics with an optional benchmark regression
-    for alpha and beta. Plots a cumulative return curve for visual context.
-    """
+    """Headline performance stats with an optional alpha/beta regression."""
     cum = (1 + port_ret).cumprod()
     peak = cum.cummax()
     dd = (cum - peak) / peak
@@ -216,10 +189,7 @@ def stats(port_ret, weights=None, benchmark=None, plot=True):
 
 
 def ic(signal_df, prices_df, horizons=(1, 5, 10, 20)):
-    """
-    Spearman rank IC of the signal against forward returns at each horizon,
-    with the standard ICIR scaling for stability across time.
-    """
+    """Spearman rank IC and ICIR at each forward-return horizon."""
     results = {}
     for h in horizons:
         fwd = prices_df.pct_change(h).shift(-h)
@@ -234,11 +204,7 @@ def ic(signal_df, prices_df, horizons=(1, 5, 10, 20)):
 # ---------------------------------------------------------------------------
 
 def dist_plot(returns, title="Return distribution"):
-    """
-    Histogram with normal overlay, plus a QQ plot. The Gaussian fit makes
-    fat tails visually obvious; the QQ plot quantifies how far departures
-    from normality run in the tails.
-    """
+    """Histogram with normal overlay and a QQ plot against the normal."""
     r = returns.dropna()
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
@@ -257,13 +223,11 @@ def dist_plot(returns, title="Return distribution"):
 
 def var_cvar(returns, alpha=0.05):
     """
-    Historical and parametric (Gaussian) value-at-risk and expected shortfall.
+    Historical and parametric (Gaussian) VaR and CVaR at level alpha.
 
-    VaR is the alpha-quantile loss; CVaR is the average loss conditional on
-    breaching VaR. The historical estimate is non-parametric and captures
-    realized fat tails; the parametric estimate assumes Gaussian returns
-    and will underestimate tail risk when skewness or kurtosis is large.
-    The gap between the two is itself informative.
+    Historical is the empirical alpha-quantile and conditional mean below
+    it. Parametric assumes Gaussian returns and will understate tail risk
+    when skewness or excess kurtosis is large.
     """
     r = returns.dropna()
     hist_var = r.quantile(alpha)
@@ -283,9 +247,7 @@ def var_cvar(returns, alpha=0.05):
 # ---------------------------------------------------------------------------
 
 def beta_to(returns_df, benchmark, lookback=252):
-    """
-    Rolling beta of each stock to a benchmark, computed via cov / var.
-    """
+    """Rolling per-stock beta to a benchmark, cov / var."""
     b_aligned = benchmark.reindex(returns_df.index)
     cov = returns_df.rolling(lookback).cov(b_aligned)
     var = b_aligned.rolling(lookback).var()
@@ -294,12 +256,11 @@ def beta_to(returns_df, benchmark, lookback=252):
 
 def neutralize(signal_df, factor_df):
     """
-    Cross-sectional residual of the signal after regressing on a single factor.
+    Cross-sectional residual of the signal after regressing on one factor.
 
-    For each date we run a one-variable OLS across stocks and replace
-    the signal with its residual, removing the linear component that is
-    explained by the factor. Useful for stripping out market-beta
-    exposure so that the remaining signal expresses an independent view.
+    Per date, run OLS of the signal on the factor across stocks and
+    replace the signal with the residual. Used to strip out market-beta
+    exposure.
     """
     s, f = signal_df.align(factor_df, join="inner")
     out = pd.DataFrame(index=s.index, columns=s.columns, dtype=float)
@@ -310,14 +271,11 @@ def neutralize(signal_df, factor_df):
         if mask.sum() < 30:
             continue
         X = sm.add_constant(x[mask])
-        try:
-            beta = np.linalg.lstsq(X, y[mask], rcond=None)[0]
-            resid = y[mask] - X @ beta
-            row = np.full_like(y, np.nan, dtype=float)
-            row[mask] = resid
-            out.loc[date] = row
-        except Exception:
-            continue
+        beta = np.linalg.lstsq(X, y[mask], rcond=None)[0]
+        resid = y[mask] - X @ beta
+        row = np.full_like(y, np.nan, dtype=float)
+        row[mask] = resid
+        out.loc[date] = row
     return out
 
 
@@ -327,13 +285,10 @@ def neutralize(signal_df, factor_df):
 
 def walk_forward_splits(index, train_years=5, test_years=1):
     """
-    Yield (train_slice, test_slice) tuples for rolling walk-forward
-    evaluation. Each test window is disjoint from its training window,
-    and the windows roll forward by `test_years` each step.
+    Yield rolling (train_slice, test_slice) pairs.
 
-    Walk-forward is a more honest robustness check than a single
-    in-sample / out-of-sample split because it exposes the strategy
-    to multiple regimes rather than just one historical cut.
+    Test windows are disjoint from their training windows and roll
+    forward by `test_years` each step.
     """
     index = pd.DatetimeIndex(index)
     start = index.min()

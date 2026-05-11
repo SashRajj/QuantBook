@@ -68,12 +68,12 @@ optimized backtest, out-of-sample validation, annual returns. The mean
 reversion notebook additionally demonstrates factor neutralization against
 rolling SPY beta.
 
-Each signal notebook now also includes a **return distribution and tail
-risk** section (histogram vs Gaussian, QQ plot, historical and parametric
-VaR / CVaR at 1% and 5%) on the optimised in-sample and out-of-sample
-PnL. The mean reversion notebook additionally runs a **Sharpe-based grid
-search** alongside the IC heatmap, since IC and net Sharpe can disagree
-once transaction costs and covariance structure enter the picture.
+Each signal notebook also includes a return-distribution and tail-risk
+section (histogram vs Gaussian, QQ plot, historical and parametric VaR
+and CVaR at 1% and 5%) on the optimised in-sample and out-of-sample PnL.
+The mean reversion notebook additionally runs a Sharpe-based grid search
+alongside the IC heatmap, since IC and net Sharpe can disagree once
+transaction costs and covariance structure enter.
 
 ## The portfolio notebook
 
@@ -130,9 +130,6 @@ unimplementable in practice.
 
 ## Caveats and known limitations
 
-The project is intentionally honest about its weaknesses; pretending they
-do not exist would be a credibility hit on its own.
-
 - **Survivorship bias.** `download_sp500.py` pulls today's S&P 500 members
   from Wikipedia and downloads their full history. Stocks that were
   delisted or removed from the index over the sample period (Lehman,
@@ -155,14 +152,13 @@ do not exist would be a credibility hit on its own.
 
 ## Why these signals
 
-The three were chosen to span distinct theoretical categories so the
-portfolio notebook has something to combine:
+The three span distinct theoretical categories so the portfolio notebook
+has something to combine:
 
 - Mean reversion is a *contrarian* signal driven by short-horizon noise.
 - Momentum is a *trend-following* signal driven by behavioural underreaction.
 - Low volatility is a *risk-based* anomaly driven by frictions on the
   marginal investor.
 
-The intent is not to claim these are novel; they are textbook factors.
-The intent is to build an honest evaluation pipeline around them and
-demonstrate that the same template generalises.
+They are textbook factors; the point of the project is the evaluation
+template around them, not the signals themselves.

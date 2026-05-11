@@ -18,7 +18,6 @@ data/
 # IDE / tooling
 .vscode/
 .idea/
-.claude/
 
 # OS
 .DS_Store

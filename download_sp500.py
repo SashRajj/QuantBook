@@ -26,11 +26,9 @@ def get_sp500_tickers():
 def main():
     DATA_DIR.mkdir(exist_ok=True)
 
-    # Step 1: Get current S&P 500 tickers from Wikipedia.
     sp500 = get_sp500_tickers()
     print(f"Found {len(sp500)} S&P 500 tickers")
 
-    # Step 2: Download adjusted price data (auto_adjust=True handles dividends + splits).
     data = yf.download(
         sp500,
         start=START_DATE,
@@ -41,7 +39,6 @@ def main():
     print(f"Downloaded data shape: {data.shape}")
     print(f"Date range: {data.index.min()} to {data.index.max()}")
 
-    # Step 3: Save everything in one file (Close/High/Low/Open/Volume, all adjusted).
     data.to_parquet(DATA_DIR / "sp500.parquet")
 
     close = data["Close"]
@@ -50,7 +47,6 @@ def main():
     print(f"Tickers with any data: {(close.notna().any()).sum()}")
     print(f"File saved to {DATA_DIR / 'sp500.parquet'}")
 
-    # Step 4: Download SPY benchmark.
     spy = yf.download("SPY", start=START_DATE, end=END_DATE, auto_adjust=True)
     spy.to_parquet(DATA_DIR / "spy.parquet")
     print(f"SPY: {len(spy)} trading days, saved to {DATA_DIR / 'spy.parquet'}")
