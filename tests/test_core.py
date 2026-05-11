@@ -22,6 +22,7 @@ from signals import (
     market_residual_momentum,
     mean_reversion,
     momentum,
+    volume_adjusted_momentum,
 )
 
 
@@ -148,6 +149,24 @@ class CoreFunctionTests(unittest.TestCase):
         # DSR must be no higher than PSR when n_trials > 1.
         dsr = deflated_sharpe(good, n_trials=20)
         self.assertLessEqual(dsr, psr_good + 1e-9)
+
+    def test_volume_adjusted_momentum_shape_and_no_lookahead(self):
+        rng = np.random.default_rng(3)
+        dates = pd.date_range("2022-01-01", periods=120, freq="D")
+        cols = ["AAA", "BBB", "CCC"]
+        close = pd.DataFrame(rng.lognormal(0, 0.02, (len(dates), 3)),
+                             index=dates, columns=cols).cumprod() * 100
+        volume = pd.DataFrame(rng.lognormal(15, 0.5, (len(dates), 3)),
+                              index=dates, columns=cols)
+        sig = volume_adjusted_momentum(close, volume, lookback=10)
+        self.assertEqual(sig.shape, close.shape)
+        self.assertTrue(sig.iloc[:10].isna().all().all())
+        # Changing a future row must not change a past signal value.
+        perturbed = close.copy()
+        perturbed.iloc[-1] *= 2
+        sig2 = volume_adjusted_momentum(perturbed, volume, lookback=10)
+        pd.testing.assert_frame_equal(sig.iloc[:-1].dropna(how="all"),
+                                      sig2.iloc[:-1].dropna(how="all"))
 
     def test_market_residual_momentum_matches_shape_and_uses_only_past(self):
         rng = np.random.default_rng(1)

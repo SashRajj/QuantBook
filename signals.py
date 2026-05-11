@@ -34,6 +34,23 @@ def low_volatility(close, lookback=63):
     return -vol
 
 
+def volume_adjusted_momentum(close, volume, lookback=20):
+    """
+    Rolling mean return scaled by the square root of relative volume.
+
+    `mean_return * sqrt(volume / rolling_mean_volume)`. The idea is that
+    a price move on above-average volume is more informative about
+    persistent flow than the same move on quiet volume; the sqrt softens
+    the contribution of volume spikes. Adapted from an earlier in-house
+    crypto momentum study.
+    """
+    rets = close.pct_change()
+    mean_ret = rets.rolling(lookback, min_periods=lookback).mean()
+    vol_ma = volume.rolling(lookback, min_periods=lookback).mean()
+    vol_ratio = (volume / vol_ma).replace([np.inf, -np.inf], np.nan)
+    return mean_ret * np.sqrt(vol_ratio)
+
+
 def market_residual_momentum(close, market_close, lookback=252, skip=21,
                              beta_lookback=252):
     """

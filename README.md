@@ -26,13 +26,15 @@ realistic two-day execution lag for equities:
 | 04 | Combined equity (IS, IC-weighted) | -0.30 | -2.02% | -0.36 | – | no |
 | 04 | Combined equity (OOS) | -0.17 | +1.48% | 0.16 | – | no |
 | 07 | Standalone crypto momentum (opt) | 0.88 | +35.3% | 1.56 | – | borderline |
-| **07** | **Crypto combined (IC-weighted)** | **1.04** | **+36.6%** | **2.32** | **0.74** | **yes** |
+| **07** | **Standalone crypto VolMom (opt)** | **0.83** | **+50.4%** | **2.13** | – | **yes** |
+| **07** | **Crypto combined (IC-weighted, 5 signals)** | **1.16** | **+40.3%** | **2.55** | **0.79** | **yes** |
 
-Of every strategy tested across two asset classes, only the crypto
-combined portfolio clears the standard `|t| > 2` significance bar once
-realistic costs and HAC standard errors are applied. The classical
-equity factors do not, including the survivorship-corrected versions in
-the rewritten notebooks. This is the project's main result.
+Two strategies clear the standard `|t| > 2` significance bar once
+realistic costs and HAC standard errors are applied — both are crypto,
+both market-neutral against BTC, and both are dollar-neutral
+cross-sectional constructions. The classical equity factors do not pass,
+including the survivorship-corrected versions in the rewritten notebooks.
+This is the project's main result.
 
 What the equity notebooks are good for is calibration: they confirm
 that the framework is honest. A pipeline that runs survivorship-corrected
@@ -158,14 +160,17 @@ Binance.US (2019-09 to present). What changes versus equities:
   limited; the construction assumes perpetual-futures execution.
   Funding cost is acknowledged but not modelled.
 
-Result on the IC-weighted four-signal combiner (`lookback=90` days,
-`horizon=14`-day IC): **Sharpe 1.04, t-stat 2.29, alpha vs BTC 36.6%
-annual (t=2.33), beta to BTC -0.04**, Probabilistic Sharpe 0.99,
-Deflated Sharpe (8 trials) 0.74. The signals that did not work on
+Result on the IC-weighted five-signal combiner (`lookback=90` days,
+`horizon=14`-day IC): **Sharpe 1.16, alpha vs BTC 40.3% annual (HAC
+t-stat 2.55), beta to BTC -0.01**, Probabilistic Sharpe 0.99, Deflated
+Sharpe (10 trials) 0.79. The five inputs are mean reversion, momentum,
+low volatility, market-residual momentum, and volume-adjusted momentum
+(`mean_return * sqrt(volume / rolling_mean_volume)`, ported from an
+earlier crypto-momentum study). The signals that did not work on
 equities (low-vol especially) have meaningful IC at multi-day horizons
-in crypto, which the combiner correctly leans into. Standalone
-optimised cross-sectional momentum also clears Sharpe 0.88 with
-t-stat 2.13.
+in crypto, which the combiner correctly leans into. Standalone optimised
+volume-adjusted momentum on its own clears HAC t = 2.13; cross-sectional
+plain momentum reaches HAC t = 1.56.
 
 Caveats specific to crypto: only six years of history concentrated
 around the 2021-2022 boom-bust, narrow breadth (30 names vs 500),
