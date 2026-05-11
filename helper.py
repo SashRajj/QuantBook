@@ -310,12 +310,15 @@ def ic_weighted_combine(signal_dict, prices_df, lookback=126, min_ic=0.0,
     aligned = {name: sig.reindex(index=idx, columns=cols)
                for name, sig in signal_dict.items()}
 
-    # Trailing IC per signal, shifted to avoid look-ahead in the weighting.
+    # Trailing IC per signal, shifted by the full horizon so the
+    # forward return the IC depends on is entirely in the past at the
+    # date the weight is applied. A naive shift of 1 is only correct for
+    # horizon=1 and silently leaks information at any longer horizon.
     weights = {}
     for name, sig in aligned.items():
         ic_t = sig.corrwith(fwd.reindex(index=idx, columns=cols),
                             axis=1, method="spearman")
-        weights[name] = (ic_t.shift(1)
+        weights[name] = (ic_t.shift(horizon)
                          .rolling(lookback, min_periods=lookback // 2)
                          .mean()
                          .clip(lower=min_ic))

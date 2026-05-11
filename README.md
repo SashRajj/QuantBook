@@ -27,14 +27,22 @@ realistic two-day execution lag for equities:
 | 04 | Combined equity (OOS) | -0.17 | +1.48% | 0.16 | – | no |
 | 07 | Standalone crypto momentum (opt) | 0.88 | +35.3% | 1.56 | – | borderline |
 | **07** | **Standalone crypto VolMom (opt)** | **0.83** | **+50.4%** | **2.13** | – | **yes** |
-| **07** | **Crypto combined (IC-weighted, 5 signals)** | **1.16** | **+40.3%** | **2.55** | **0.79** | **yes** |
+| 07 | Crypto combined (IC-weighted, IS 2019-23) | 0.19 | +5.3% | 0.30 | 0.16 | no |
+| 07 | Crypto combined (IC-weighted, OOS 2024+) | -0.50 | -20.2% | -0.71 | 0.03 | no |
 
-Two strategies clear the standard `|t| > 2` significance bar once
-realistic costs and HAC standard errors are applied — both are crypto,
-both market-neutral against BTC, and both are dollar-neutral
-cross-sectional constructions. The classical equity factors do not pass,
-including the survivorship-corrected versions in the rewritten notebooks.
-This is the project's main result.
+Exactly one strategy clears the `|t| > 2` significance bar once realistic
+costs and HAC standard errors are applied: standalone optimised
+volume-adjusted momentum on crypto. An earlier version of this table
+reported the IC-weighted combined portfolio at HAC t = 2.55, but that
+result was an artifact of a look-ahead bug in `ic_weighted_combine` —
+the IC weighting at horizon = 14 was being shifted by only one day,
+which silently used 13 days of future returns in the weighting decision.
+Once the shift is corrected to the full horizon, the combined portfolio
+drops to Sharpe ≈ 0 in-sample and goes negative out-of-sample. The bug,
+the catch, and the demotion of the headline result are documented in
+the git history (commit fixing `ic_weighted_combine`). The classical
+equity factors do not pass either, including the survivorship-corrected
+versions in the rewritten notebooks. This is the project's main result.
 
 What the equity notebooks are good for is calibration: they confirm
 that the framework is honest. A pipeline that runs survivorship-corrected
@@ -160,17 +168,20 @@ Binance.US (2019-09 to present). What changes versus equities:
   limited; the construction assumes perpetual-futures execution.
   Funding cost is acknowledged but not modelled.
 
-Result on the IC-weighted five-signal combiner (`lookback=90` days,
-`horizon=14`-day IC): **Sharpe 1.16, alpha vs BTC 40.3% annual (HAC
-t-stat 2.55), beta to BTC -0.01**, Probabilistic Sharpe 0.99, Deflated
-Sharpe (10 trials) 0.79. The five inputs are mean reversion, momentum,
-low volatility, market-residual momentum, and volume-adjusted momentum
-(`mean_return * sqrt(volume / rolling_mean_volume)`, ported from an
-earlier crypto-momentum study). The signals that did not work on
-equities (low-vol especially) have meaningful IC at multi-day horizons
-in crypto, which the combiner correctly leans into. Standalone optimised
-volume-adjusted momentum on its own clears HAC t = 2.13; cross-sectional
-plain momentum reaches HAC t = 1.56.
+The five candidate signals are mean reversion, momentum, low volatility,
+market-residual momentum, and volume-adjusted momentum (`mean_return *
+sqrt(volume / rolling_mean_volume)`, ported from an earlier crypto-momentum
+study). Each is run through the per-signal optimizer and through an
+IC-weighted combiner.
+
+**Headline result**: standalone optimised volume-adjusted momentum
+reaches Sharpe 0.83 with **HAC alpha t-stat 2.13** vs BTC. That is the
+only crypto strategy that clears the `|t| > 2` bar after the look-ahead
+audit. Standalone optimised cross-sectional momentum reaches HAC
+t = 1.56 (borderline). The IC-weighted combined portfolio reports
+Sharpe ≈ 0 in-sample (t = 0.30) and Sharpe -0.50 out-of-sample (t = -0.71)
+after the combiner shift bug was corrected; the previously-reported
+combined Sharpe of 1.16 was driven by that bug.
 
 Caveats specific to crypto: only six years of history concentrated
 around the 2021-2022 boom-bust, narrow breadth (30 names vs 500),

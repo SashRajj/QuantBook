@@ -196,6 +196,37 @@ class CoreFunctionTests(unittest.TestCase):
             sig_after.iloc[:-1].dropna(how="all"),
         )
 
+    def test_ic_weighted_combiner_has_no_lookahead(self):
+        # If the combiner's IC weighting peeks at future returns, perturbing
+        # a future price should change a past combined signal value. Build
+        # the combined signal twice with one future price changed and assert
+        # the past rows are identical.
+        rng = np.random.default_rng(7)
+        dates = pd.date_range("2018-01-01", periods=400, freq="B")
+        cols = [f"X{i}" for i in range(10)]
+        close = pd.DataFrame(rng.lognormal(0, 0.01, (len(dates), len(cols))),
+                             index=dates, columns=cols).cumprod() * 100
+        signal_a = pd.DataFrame(rng.normal(0, 1, (len(dates), len(cols))),
+                                index=dates, columns=cols)
+        signal_b = pd.DataFrame(rng.normal(0, 1, (len(dates), len(cols))),
+                                index=dates, columns=cols)
+
+        combined_orig, _ = ic_weighted_combine(
+            {"a": signal_a, "b": signal_b}, close, lookback=60, horizon=5,
+        )
+        # Perturb future prices only (last 50 rows).
+        close_perturbed = close.copy()
+        close_perturbed.iloc[-50:] *= 2
+        combined_pert, _ = ic_weighted_combine(
+            {"a": signal_a, "b": signal_b}, close_perturbed, lookback=60, horizon=5,
+        )
+        # Past rows (the first 300, leaving margin before the perturbation
+        # plus horizon) must be unchanged.
+        pd.testing.assert_frame_equal(
+            combined_orig.iloc[:300].dropna(how="all"),
+            combined_pert.iloc[:300].dropna(how="all"),
+        )
+
     def test_ic_weighted_combiner_downweights_pure_noise(self):
         rng = np.random.default_rng(2)
         dates = pd.date_range("2018-01-01", periods=500, freq="B")
