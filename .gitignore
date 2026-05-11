@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Pytest
+.pytest_cache/
+
+# Data (regenerated from download_sp500.py)
+data/
+
+# IDE / tooling
+.vscode/
+.idea/
+.claude/
+
+# OS
+.DS_Store
