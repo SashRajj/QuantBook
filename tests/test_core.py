@@ -9,6 +9,7 @@ from helper import (
     beta_to,
     deflated_sharpe,
     ic,
+    ic_weighted_combine,
     neutralize,
     port_ret,
     probabilistic_sharpe,
@@ -16,7 +17,12 @@ from helper import (
     stats,
     var_cvar,
 )
-from signals import low_volatility, mean_reversion, momentum
+from signals import (
+    low_volatility,
+    market_residual_momentum,
+    mean_reversion,
+    momentum,
+)
 
 
 class CoreFunctionTests(unittest.TestCase):
@@ -142,6 +148,60 @@ class CoreFunctionTests(unittest.TestCase):
         # DSR must be no higher than PSR when n_trials > 1.
         dsr = deflated_sharpe(good, n_trials=20)
         self.assertLessEqual(dsr, psr_good + 1e-9)
+
+    def test_market_residual_momentum_matches_shape_and_uses_only_past(self):
+        rng = np.random.default_rng(1)
+        dates = pd.date_range("2020-01-01", periods=400, freq="B")
+        mkt = pd.Series(rng.normal(0.0005, 0.01, len(dates)), index=dates).cumsum() + 100
+        # Stocks: market beta 1 + idio noise
+        cols = ["AAA", "BBB", "CCC", "DDD"]
+        idio = pd.DataFrame(rng.normal(0, 0.005, (len(dates), len(cols))),
+                            index=dates, columns=cols).cumsum()
+        close = idio.add(mkt, axis=0)
+
+        sig = market_residual_momentum(close, mkt, lookback=60, skip=5,
+                                       beta_lookback=60)
+        self.assertEqual(sig.shape, close.shape)
+        # Before the rolling window is full, the signal is undefined.
+        self.assertTrue(sig.iloc[:65].isna().all().all())
+        # No look-ahead: changing a future price must not change a past signal.
+        sig_before = sig.copy()
+        close_perturbed = close.copy()
+        close_perturbed.iloc[-1] *= 2
+        sig_after = market_residual_momentum(close_perturbed, mkt,
+                                             lookback=60, skip=5,
+                                             beta_lookback=60)
+        # Drop the last row where the perturbation legitimately changes things.
+        pd.testing.assert_frame_equal(
+            sig_before.iloc[:-1].dropna(how="all"),
+            sig_after.iloc[:-1].dropna(how="all"),
+        )
+
+    def test_ic_weighted_combiner_downweights_pure_noise(self):
+        rng = np.random.default_rng(2)
+        dates = pd.date_range("2018-01-01", periods=500, freq="B")
+        cols = [f"N{i}" for i in range(20)]
+
+        # Build prices so true 1-day forward return = +1 * informative_signal + noise.
+        informative = pd.DataFrame(rng.normal(0, 1, (len(dates), len(cols))),
+                                   index=dates, columns=cols)
+        noise = pd.DataFrame(rng.normal(0, 1, (len(dates), len(cols))),
+                             index=dates, columns=cols)
+        # Construct prices so that next-day return is informative.shift(-1)
+        # by setting close_t+1 / close_t = 1 + 0.01 * informative_t.
+        ret = 0.01 * informative.shift(1).fillna(0)
+        close = (1 + ret).cumprod() * 100
+
+        combined, weights = ic_weighted_combine(
+            {"good": informative, "noise": noise},
+            close,
+            lookback=60,
+        )
+
+        # After warm-up the good signal should consistently win more weight.
+        late_w = weights.iloc[200:].mean()
+        self.assertGreater(late_w["good"], late_w["noise"])
+        self.assertGreater(late_w["good"], 0.5)
 
     def test_downloader_helpers_are_import_safe(self):
         self.assertTrue(hasattr(download_sp500, "main"))

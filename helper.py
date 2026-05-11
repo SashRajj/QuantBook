@@ -271,6 +271,58 @@ def ic(signal_df, prices_df, horizons=(1, 5, 10, 20)):
     return pd.DataFrame(results).T
 
 
+def ic_weighted_combine(signal_dict, prices_df, lookback=126, min_ic=0.0,
+                        horizon=1):
+    """
+    Combine signals with weights proportional to trailing IC.
+
+    For each date, the weight on signal s is the rolling mean of its
+    cross-sectional Spearman IC over the last `lookback` days (shifted
+    by one day so the IC computed today is not used to weight today's
+    signal). Signals with mean IC below `min_ic` get zero weight.
+
+    Returns a single combined signal DataFrame aligned to the union of
+    the input signals' indices and columns.
+    """
+    fwd = prices_df.pct_change(horizon).shift(-horizon)
+
+    # Align all signals to a shared index/columns.
+    idx = None
+    cols = None
+    for sig in signal_dict.values():
+        idx = sig.index if idx is None else idx.union(sig.index)
+        cols = sig.columns if cols is None else cols.union(sig.columns)
+    aligned = {name: sig.reindex(index=idx, columns=cols)
+               for name, sig in signal_dict.items()}
+
+    # Trailing IC per signal, shifted to avoid look-ahead in the weighting.
+    weights = {}
+    for name, sig in aligned.items():
+        ic_t = sig.corrwith(fwd.reindex(index=idx, columns=cols),
+                            axis=1, method="spearman")
+        weights[name] = (ic_t.shift(1)
+                         .rolling(lookback, min_periods=lookback // 2)
+                         .mean()
+                         .clip(lower=min_ic))
+    w_df = pd.DataFrame(weights, index=idx).fillna(0.0)
+
+    # Cross-sectional z-score per signal so they are on comparable scales.
+    def _zscore(df):
+        mu = df.mean(axis=1)
+        sd = df.std(axis=1).replace(0, np.nan)
+        return df.subtract(mu, axis=0).divide(sd, axis=0)
+
+    z = {name: _zscore(sig) for name, sig in aligned.items()}
+
+    # Combine: weighted sum, then normalise weights so the combined
+    # signal scale is comparable across dates.
+    w_sum = w_df.sum(axis=1).replace(0, np.nan)
+    w_norm = w_df.divide(w_sum, axis=0)
+
+    combined = sum(z[name].multiply(w_norm[name], axis=0) for name in z)
+    return combined, w_norm
+
+
 # ---------------------------------------------------------------------------
 # Adjusted Sharpe statistics
 # ---------------------------------------------------------------------------

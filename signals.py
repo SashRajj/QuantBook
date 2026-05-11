@@ -32,3 +32,33 @@ def low_volatility(close, lookback=63):
     rets = close.pct_change()
     vol = rets.rolling(lookback, min_periods=lookback).std()
     return -vol
+
+
+def market_residual_momentum(close, market_close, lookback=252, skip=21,
+                             beta_lookback=252):
+    """
+    Sum of market-residual daily returns over the formation window.
+
+    Per Blitz, Huij, and Martens (2011): regress each stock's return on
+    the market, take the residual, and use the cumulative residual over
+    the trailing 12 minus 1 month window as the momentum signal. Strips
+    out the market-beta component that drives most momentum crashes at
+    regime transitions.
+
+    `market_close` is a Series of the benchmark adjusted close.
+    """
+    rets = close.pct_change()
+    mkt = market_close.reindex(close.index).pct_change()
+
+    # Rolling per-name beta to the market.
+    cov = rets.rolling(beta_lookback, min_periods=beta_lookback).cov(mkt)
+    var = mkt.rolling(beta_lookback, min_periods=beta_lookback).var()
+    beta = cov.divide(var, axis=0)
+
+    # Residual returns; broadcasting beta * mkt_t against each column.
+    resid = rets.subtract(beta.multiply(mkt, axis=0), axis=0)
+
+    # Cumulative residual return over the 12-1 month window.
+    cum_to_skip = resid.shift(skip).rolling(lookback - skip,
+                                            min_periods=lookback - skip).sum()
+    return cum_to_skip
