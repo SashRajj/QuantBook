@@ -216,12 +216,16 @@ def quick_weights(signal_df, dollar_neutral=True, long_only=False,
 # Performance and risk statistics
 # ---------------------------------------------------------------------------
 
-def stats(port_ret, weights=None, benchmark=None, plot=True, periods_per_year=252):
+def stats(port_ret, weights=None, benchmark=None, plot=True, periods_per_year=252,
+          hac_lags=5):
     """
     Headline performance stats with an optional alpha/beta regression.
 
     `periods_per_year` controls the annualisation factor: 252 for daily
-    equity returns, 365 for daily crypto.
+    equity returns, 365 for daily crypto. `hac_lags` selects the Newey-West
+    lag for HAC standard errors on the alpha regression; pass 0 to fall
+    back to plain OLS (faster, but t-stats are inflated when daily
+    returns are autocorrelated).
     """
     cum = (1 + port_ret).cumprod()
     peak = cum.cummax()
@@ -245,7 +249,12 @@ def stats(port_ret, weights=None, benchmark=None, plot=True, periods_per_year=25
     if benchmark is not None:
         df = pd.concat([port_ret, benchmark], axis=1).dropna()
         X = sm.add_constant(df.iloc[:, 1])
-        model = sm.OLS(df.iloc[:, 0], X).fit()
+        if hac_lags and hac_lags > 0:
+            model = sm.OLS(df.iloc[:, 0], X).fit(
+                cov_type="HAC", cov_kwds={"maxlags": int(hac_lags)}
+            )
+        else:
+            model = sm.OLS(df.iloc[:, 0], X).fit()
         s["alpha_annual"] = f"{model.params.iloc[0] * ppy * 100:.2f}%"
         s["alpha_tstat"] = round(model.tvalues.iloc[0], 3)
         s["beta"] = round(model.params.iloc[1], 3)

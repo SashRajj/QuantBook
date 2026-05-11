@@ -1,15 +1,55 @@
-# Cross-Sectional Equity Signal Research
+# Cross-Sectional Signal Research
 
-A self-contained quant research project on the S&P 500. Three independent
-cross-sectional signals are constructed from daily prices, evaluated under
-the same template, then combined into a single portfolio whose risk and
-distributional properties are examined in detail.
+A self-contained quant research project on the S&P 500 and the top 30
+crypto pairs. The same cross-sectional signal-and-portfolio framework
+is applied to both asset classes, with realistic execution costs,
+point-in-time index membership for equities, autocorrelation-robust
+standard errors on every alpha regression, and Deflated Sharpe reporting
+on the headline results.
 
-The goal of the project is to walk through the full research workflow
-end-to-end: data preparation, signal construction, information-coefficient
+## Headline result
+
+Across all strategies, applied with consistent transaction costs (5 bps
+per side on equity, 10 bps per side on crypto), HAC-corrected
+(Newey-West, 5 lag) standard errors on the alpha regression, and the
+realistic two-day execution lag for equities:
+
+| Notebook | Strategy | Sharpe | Alpha (ann) | Alpha t-stat (HAC) | DSR | Passes \|t\|>2 |
+|---|---|---:|---:|---:|---:|:---:|
+| 01 | Rank-weighted mean rev (IS) | 0.17 | +0.28% | 0.21 | – | no |
+| 01 | Optimized mean rev (IS) | 0.12 | -1.59% | -0.42 | ~0 | no |
+| 01 | Optimized mean rev (OOS) | -0.45 | -11.12% | -1.79 | ~0 | no |
+| 02 | Optimized momentum (IS) | -0.31 | -4.07% | -0.63 | – | no |
+| 02 | Optimized momentum (OOS) | 0.09 | +2.53% | 0.27 | – | no |
+| 03 | Optimized low-vol (IS) | -0.72 | -8.27% | -1.91 | – | no |
+| 03 | Optimized low-vol (OOS) | -0.52 | +2.56% | 0.34 | – | no |
+| 04 | Combined equity (IS, IC-weighted) | -0.30 | -2.02% | -0.36 | – | no |
+| 04 | Combined equity (OOS) | -0.17 | +1.48% | 0.16 | – | no |
+| 07 | Standalone crypto momentum (opt) | 0.88 | +35.3% | 1.56 | – | borderline |
+| **07** | **Crypto combined (IC-weighted)** | **1.04** | **+36.6%** | **2.32** | **0.74** | **yes** |
+
+Of every strategy tested across two asset classes, only the crypto
+combined portfolio clears the standard `|t| > 2` significance bar once
+realistic costs and HAC standard errors are applied. The classical
+equity factors do not, including the survivorship-corrected versions in
+the rewritten notebooks. This is the project's main result.
+
+What the equity notebooks are good for is calibration: they confirm
+that the framework is honest. A pipeline that runs survivorship-corrected
+data, point-in-time membership, realistic execution lag, asymmetric
+costs, Deflated Sharpe, and HAC SEs and reports `t = 0.21` for the
+strategy that most public-data backtests would report as `t = 4.53` (the
+no-cost version) is a pipeline you can trust when it does report a
+positive result.
+
+## Project goal
+
+To walk through the full quant research workflow end-to-end on a public
+dataset: data preparation, signal construction, information-coefficient
 analysis, parameter sensitivity, in-sample / out-of-sample validation,
 mean-variance portfolio optimization with realistic frictions, and
-portfolio-level risk diagnostics.
+portfolio-level risk diagnostics, with statistical-significance and
+multiple-testing corrections applied consistently.
 
 ## Repository layout
 
