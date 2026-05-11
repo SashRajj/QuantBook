@@ -18,8 +18,14 @@ class Optimizer:
     Per-date mean-variance optimization.
 
     Signals are cross-sectionally rank-normalized then standardized.
-    Covariance is estimated once on the training panel with Ledoit-Wolf
-    shrinkage.
+    Covariance is estimated on the training panel with Ledoit-Wolf
+    shrinkage; missing return entries are replaced with each name's
+    in-window mean so that delisted or newly-listed stocks do not pull
+    correlations toward zero.
+
+    A `member_mask` panel (date x ticker, boolean) can be passed to
+    `run` to enforce point-in-time index membership: names that were
+    not in the index on a given date are constrained to zero weight.
     """
 
     def __init__(self, signal_df, returns_df):
@@ -31,51 +37,70 @@ class Optimizer:
         ranked = clean_signal.rank(axis=1, pct=True) - 0.5
         self.alpha_df = (ranked.subtract(ranked.mean(axis=1), axis=0)
                                .divide(ranked.std(axis=1) + 1e-6, axis=0))
-        self.cov = LedoitWolf().fit(
-            returns_df.fillna(0).replace([np.inf, -np.inf], 0).values
-        ).covariance_
+
+        ret_clean = returns_df.replace([np.inf, -np.inf], np.nan)
+        col_means = ret_clean.mean()
+        ret_filled = ret_clean.fillna(col_means).fillna(0).values
+        self.cov = LedoitWolf().fit(ret_filled).covariance_
+        self.columns = self.alpha_df.columns
 
     def run(self, dollar_neutral=True, fully_invested=False,
             max_position=None, long_only=False, max_leverage=None,
-            target_vol=None, tcost_penalty_bps=0, subsample=1, verbose=False):
+            target_vol=None, tcost_penalty_bps=0, subsample=1,
+            member_mask=None, verbose=False):
         """
         Solve the per-date QP and return a weights DataFrame.
 
-        The cvxpy problem is built once with `cp.Parameter` for alpha and
-        previous weights; the date loop only updates parameter values and
-        re-solves with warm-starting. `tcost_penalty_bps` adds an L1
-        turnover penalty inside the objective; `subsample=k` solves every
-        k-th date and forward-fills weights in between.
+        Built once with `cp.Parameter` for alpha, previous weights, and
+        per-name position bounds; the date loop only updates parameter
+        values and re-solves with warm-starting.
+
+        `member_mask` is an optional (date x ticker) boolean panel
+        marking which names are in the eligible universe on each date.
+        Non-members on a given date are pinned to zero weight via the
+        per-name bound parameters.
         """
         if long_only and dollar_neutral:
             raise ValueError("long_only=True is incompatible with dollar_neutral=True")
 
         lam = tcost_penalty_bps / 10000
-        n = len(self.alpha_df.columns)
+        n = len(self.columns)
 
         alpha_p = cp.Parameter(n)
         w_prev_p = cp.Parameter(n) if lam > 0 else None
         if w_prev_p is not None:
             w_prev_p.value = np.zeros(n)
 
+        # Per-name bounds are always present so the same problem object
+        # can serve all callers; the default cap is large enough not to
+        # bind when max_position is not set.
+        default_cap = 1.0 if max_position is None else max_position
+        ub_p = cp.Parameter(n)
+        lb_p = cp.Parameter(n)
+        ub_p.value = np.full(n, default_cap)
+        lb_p.value = np.full(n, 0.0 if long_only else -default_cap)
+
         w = cp.Variable(n)
-        c = []
+        c = [w <= ub_p, w >= lb_p]
         if dollar_neutral:
             c.append(cp.sum(w) == 0)
         if fully_invested:
             c.append(cp.norm(w, 1) <= 1.0)
         if max_leverage:
             c.append(cp.norm(w, 1) <= max_leverage)
-        if max_position:
-            c.append(w <= max_position)
-            c.append(w >= -max_position)
-        if long_only:
-            c.append(w >= 0)
 
         obj = -alpha_p @ w + cp.quad_form(w, cp.psd_wrap(self.cov))
         if lam > 0:
             obj += lam * cp.norm(w - w_prev_p, 1)
         prob = cp.Problem(cp.Minimize(obj), c)
+
+        if member_mask is not None:
+            mask_aligned = (member_mask
+                            .reindex(index=self.alpha_df.index, columns=self.columns)
+                            .fillna(False)
+                            .astype(bool))
+        else:
+            mask_aligned = None
 
         dates = self.alpha_df.index[::subsample]
         weights = {}
@@ -85,6 +110,19 @@ class Optimizer:
             alpha = self.alpha_df.loc[date].values.astype(float)
             if np.any(np.isnan(alpha)) or np.sum(np.abs(alpha)) == 0:
                 continue
+
+            if mask_aligned is not None:
+                mask_today = mask_aligned.loc[date].values
+                if not mask_today.any():
+                    continue
+                # Names outside the universe today get a zero alpha and a
+                # zero bound on both sides.
+                alpha = np.where(mask_today, alpha, 0.0)
+                ub_p.value = np.where(mask_today, default_cap, 0.0)
+                lb_p.value = np.where(mask_today,
+                                      0.0 if long_only else -default_cap,
+                                      0.0)
+
             alpha_p.value = alpha
             if w_prev_p is not None:
                 w_prev_p.value = w_old
@@ -94,6 +132,7 @@ class Optimizer:
                 continue
             if w.value is None:
                 continue
+
             w_old = np.asarray(w.value).flatten()
             if fully_invested:
                 s = np.sum(np.abs(w_old))
@@ -103,7 +142,7 @@ class Optimizer:
                 port_vol = np.sqrt(w_old @ self.cov @ w_old) * np.sqrt(252)
                 if port_vol > 0:
                     w_old = w_old * (target_vol / port_vol)
-            weights[date] = pd.Series(w_old, index=self.alpha_df.columns)
+            weights[date] = pd.Series(w_old, index=self.columns)
             if verbose and (i + 1) % 200 == 0:
                 print(f"  solved {i+1}/{len(dates)}")
 
@@ -117,13 +156,42 @@ class Optimizer:
 # Backtest plumbing
 # ---------------------------------------------------------------------------
 
-def port_ret(weights_df, returns_df, tcost_bps=0):
-    """Realized portfolio return. Weights are applied with a one-day lag."""
-    ret = (weights_df.shift(1) * returns_df).sum(axis=1)
-    if tcost_bps > 0:
-        tcost = weights_df.diff().abs().sum(axis=1) * tcost_bps / 10000
-        ret = ret - tcost
-    return ret
+def port_ret(weights_df, returns_df, tcost_bps=0, tcost_short_bps=None,
+             borrow_bps_annual=0, exec_lag=2):
+    """
+    Realized portfolio return with execution lag and asymmetric costs.
+
+    `exec_lag` is the number of days between signal observation and
+    return realization. Default 2 reflects the realistic case where a
+    signal computed at close of day t is acted on at close of t+1 and
+    earns the t+1 to t+2 return. Use `exec_lag=1` for diagnostics that
+    assume zero-latency execution.
+
+    `tcost_bps` charges per unit of turnover on long-side position
+    changes; `tcost_short_bps` (default: same as `tcost_bps`) applies to
+    short-side changes. `borrow_bps_annual` is an annualised holding fee
+    on the short book, paid daily.
+    """
+    if tcost_short_bps is None:
+        tcost_short_bps = tcost_bps
+
+    held = weights_df.shift(exec_lag)
+    gross = (held * returns_df).sum(axis=1, min_count=1)
+
+    longs_now = weights_df.clip(lower=0)
+    longs_prev = weights_df.shift(1).clip(lower=0)
+    long_turn = (longs_now - longs_prev).abs().sum(axis=1)
+
+    shorts_now = (-weights_df).clip(lower=0)
+    shorts_prev = (-weights_df).shift(1).clip(lower=0)
+    short_turn = (shorts_now - shorts_prev).abs().sum(axis=1)
+
+    tc = (long_turn * tcost_bps + short_turn * tcost_short_bps) / 10000
+
+    borrow = shorts_now.sum(axis=1).shift(exec_lag) * borrow_bps_annual / 252 / 10000
+    borrow = borrow.fillna(0)
+
+    return gross - tc - borrow
 
 
 def quick_weights(signal_df, dollar_neutral=True, long_only=False,
@@ -154,11 +222,15 @@ def stats(port_ret, weights=None, benchmark=None, plot=True):
     peak = cum.cummax()
     dd = (cum - peak) / peak
 
+    sigma = port_ret.std()
+    sharpe = round(port_ret.mean() / sigma * np.sqrt(252), 3) if sigma > 0 else np.nan
+    t_stat = round(port_ret.mean() / (sigma / np.sqrt(len(port_ret))), 3) if sigma > 0 else np.nan
+
     s = {
         "mean_return_annual": f"{port_ret.mean() * 252 * 100:.2f}%",
         "volatility_annual": f"{port_ret.std() * np.sqrt(252) * 100:.2f}%",
-        "sharpe": round(port_ret.mean() / port_ret.std() * np.sqrt(252), 3),
-        "t_stat": round(port_ret.mean() / (port_ret.std() / np.sqrt(len(port_ret))), 3),
+        "sharpe": sharpe,
+        "t_stat": t_stat,
         "max_drawdown": f"{dd.min() * 100:.2f}%",
         "avg_drawdown": f"{dd.mean() * 100:.2f}%",
         "max_dd_duration": f"{(dd < 0).astype(int).groupby((dd == 0).cumsum()).sum().max()} days",
@@ -197,6 +269,54 @@ def ic(signal_df, prices_df, horizons=(1, 5, 10, 20)):
         results[h] = {"IC": round(corr.mean(), 4),
                       "ICIR": round(corr.mean() / corr.std(), 4)}
     return pd.DataFrame(results).T
+
+
+# ---------------------------------------------------------------------------
+# Adjusted Sharpe statistics
+# ---------------------------------------------------------------------------
+
+_EULER_MASCHERONI = 0.5772156649
+
+def probabilistic_sharpe(returns, target_sharpe=0.0, periods_per_year=252):
+    """
+    Probabilistic Sharpe Ratio (Bailey and Lopez de Prado, 2012).
+
+    Probability that the true annualised Sharpe exceeds `target_sharpe`,
+    accounting for finite-sample noise plus the skew and excess kurtosis
+    of the realised return distribution.
+    """
+    r = pd.Series(returns).dropna()
+    T = len(r)
+    if T < 30 or r.std() == 0:
+        return np.nan
+    sr_p = r.mean() / r.std()
+    target_p = target_sharpe / np.sqrt(periods_per_year)
+    skew = r.skew()
+    # pandas kurt returns excess kurtosis; the PSR formula uses non-excess.
+    kurt = r.kurt() + 3
+    var_sr = (1 - skew * sr_p + ((kurt - 1) / 4.0) * sr_p ** 2) / (T - 1)
+    sigma_sr = np.sqrt(max(var_sr, 1e-12))
+    return float(sp_stats.norm.cdf((sr_p - target_p) / sigma_sr))
+
+
+def deflated_sharpe(returns, n_trials, trial_sharpe_std=0.5, periods_per_year=252):
+    """
+    Deflated Sharpe Ratio (Bailey and Lopez de Prado, 2014).
+
+    The Probabilistic Sharpe Ratio computed against a non-zero target
+    that reflects the expected maximum annualised Sharpe under the null
+    hypothesis after exploring `n_trials` candidate configurations on
+    the same data. `trial_sharpe_std` is the cross-trial annualised
+    Sharpe standard deviation; pass the empirical value from the grid
+    if available, otherwise the default 0.5 is a reasonable prior.
+    """
+    r = pd.Series(returns).dropna()
+    if n_trials <= 1:
+        return probabilistic_sharpe(r, 0.0, periods_per_year)
+    z1 = sp_stats.norm.ppf(1 - 1 / n_trials)
+    z2 = sp_stats.norm.ppf(1 - 1 / (n_trials * np.e))
+    sr_null = trial_sharpe_std * ((1 - _EULER_MASCHERONI) * z1 + _EULER_MASCHERONI * z2)
+    return probabilistic_sharpe(r, sr_null, periods_per_year)
 
 
 # ---------------------------------------------------------------------------

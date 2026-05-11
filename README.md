@@ -15,9 +15,9 @@ portfolio-level risk diagnostics.
 
 ```
 .
-├── download_sp500.py         # Fetches adjusted close prices from yfinance
+├── download_sp500.py         # Reconstructs point-in-time membership, fetches prices
 ├── signals.py                # Signal definitions (mean reversion, momentum, low vol)
-├── helper.py                 # Optimizer, IC, performance stats, VaR, factor neutralisation
+├── helper.py                 # Optimizer, IC, stats, VaR, DSR, factor neutralisation
 ├── research/
 │   ├── 01_mean_reversion.ipynb
 │   ├── 02_momentum.ipynb
@@ -128,27 +128,50 @@ penalty enters the objective directly so the optimizer trades off signal
 strength against rebalancing cost rather than producing weights that are
 unimplementable in practice.
 
-## Caveats and known limitations
+## Realism corrections
 
-- **Survivorship bias.** `download_sp500.py` pulls today's S&P 500 members
-  from Wikipedia and downloads their full history. Stocks that were
-  delisted or removed from the index over the sample period (Lehman,
-  WorldCom, Enron, etc.) are not in the dataset. Correcting this requires
-  a point-in-time constituent history that is not freely available.
-  Results should be read as upper bounds on what the same strategies
-  would have delivered on a survivorship-corrected universe.
-- **Simple cost model.** Transaction costs are modelled as a flat per-trade
-  rate. Real execution cost has a market-impact component that scales
-  with order size and market liquidity.
-- **Single-factor risk model.** Ledoit-Wolf shrinkage is reasonable for
-  a few hundred names but is not a multi-factor structural risk model.
-  Position limits and dollar neutrality compensate to some extent.
-- **Daily, close-to-close.** All rebalancing happens on close prices.
-  Intraday execution latency, opening auctions, and tick-level effects
-  are out of scope.
-- **No transaction-cost asymmetry.** Buying and selling are charged at
-  the same rate. In practice short-side costs (borrow fees, hard-to-borrow
-  spikes) are higher.
+The project addresses the realism issues that typically inflate paper
+strategies, where possible without paid data.
+
+- **Point-in-time index membership.** `download_sp500.py` parses the
+  historical changes table on Wikipedia and reconstructs the set of
+  S&P 500 members active on every trading day from 2005 to today. The
+  union of all ever-members forms the download universe (about 830
+  tickers, versus 500 in a current-only universe). The optimizer is
+  passed a date-by-date membership mask so positions are only opened in
+  names that were actually in the index on that date. This removes the
+  bulk of survivorship bias and index-membership look-ahead.
+- **Execution lag.** `port_ret` defaults to `exec_lag=2`: a signal
+  computed at the close of day t is acted on at the close of t+1 and
+  earns the t+1 to t+2 return. The previous one-day lag assumed costless
+  execution at the same close used to compute the signal.
+- **Asymmetric transaction costs.** `port_ret` charges separate bps on
+  long-side and short-side turnover and a daily holding fee on the
+  short book at a configurable annualised borrow rate.
+- **Deflated Sharpe Ratio.** `helper.deflated_sharpe` and
+  `probabilistic_sharpe` (Bailey and Lopez de Prado 2012, 2014) penalise
+  the headline Sharpe for the parameter grids explored on the same data
+  and for the skew and excess kurtosis of the realised return stream.
+- **Implausible-return filter.** `clean_prices` masks out any price
+  entry that would produce a same-day return greater than 100% in
+  absolute value, catching adjusted-close errors that yfinance returns
+  for some delisted or acquired tickers.
+
+## Remaining limitations
+
+- **Some delisted names lack yfinance data.** About 175 tickers that
+  were S&P 500 members at some point in the sample period have no usable
+  history through the free yfinance feed. The membership mask still
+  records that they should have been members on the relevant dates,
+  but the strategy cannot trade them. Residual survivorship bias is
+  therefore reduced but not eliminated.
+- **Single-factor risk model.** Ledoit-Wolf shrinkage is reasonable
+  for a few hundred names but is not a multi-factor structural risk
+  model. Position limits and dollar neutrality compensate in part.
+- **No market-impact cost.** Transaction cost is per-bps of turnover
+  with no square-root or non-linear dependence on order size.
+- **Daily, close-to-close.** Intraday execution latency, opening
+  auctions, and tick-level effects are out of scope.
 
 ## Why these signals
 
