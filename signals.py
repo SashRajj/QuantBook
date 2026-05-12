@@ -79,3 +79,40 @@ def market_residual_momentum(close, market_close, lookback=252, skip=21,
     cum_to_skip = resid.shift(skip).rolling(lookback - skip,
                                             min_periods=lookback - skip).sum()
     return cum_to_skip
+
+
+def idiosyncratic_volatility(close, market_close, lookback=60,
+                             beta_lookback=252):
+    """
+    Negated rolling stdev of market-residual daily returns.
+
+    Per Ang, Hodrick, Xing, and Zhang (2006): regress each stock's
+    return on the market via a `beta_lookback`-day rolling beta, take
+    the residual, and use its trailing `lookback`-day stdev as the
+    idiosyncratic volatility. The result is negated so that LARGER
+    signal values indicate quality (low idio vol), matching the
+    convention of the other long-the-good-stocks signals in this file.
+
+    The residual construction is identical to `market_residual_momentum`;
+    only the aggregator differs (rolling stdev vs cumulative sum, with
+    no skip). Names get NaN for the first `beta_lookback + lookback - 1`
+    rows where the signal is undefined.
+
+    `market_close` is a Series of the benchmark adjusted close.
+    """
+    rets = close.pct_change()
+    mkt = market_close.reindex(close.index).pct_change()
+
+    # Rolling per-name beta to the market — identical to the residual
+    # momentum construction.
+    cov = rets.rolling(beta_lookback, min_periods=beta_lookback).cov(mkt)
+    var = mkt.rolling(beta_lookback, min_periods=beta_lookback).var()
+    beta = cov.divide(var, axis=0)
+
+    # Residual returns; broadcasting beta * mkt_t against each column.
+    resid = rets.subtract(beta.multiply(mkt, axis=0), axis=0)
+
+    # Stdev of residuals over the formation window; negate so high =
+    # good (low idio vol).
+    idio = resid.rolling(lookback, min_periods=lookback).std()
+    return -idio

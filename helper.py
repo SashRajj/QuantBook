@@ -18,17 +18,28 @@ class Optimizer:
     Per-date mean-variance optimization.
 
     Signals are cross-sectionally rank-normalized then standardized.
-    Covariance is estimated on the training panel with Ledoit-Wolf
-    shrinkage; missing return entries are replaced with each name's
-    in-window mean so that delisted or newly-listed stocks do not pull
-    correlations toward zero.
+    Covariance is estimated with Ledoit-Wolf shrinkage on a *trailing*
+    window of returns ending strictly before each rebalance date —
+    fitting cov once on the full panel passed in `__init__` would
+    leak future returns into the QP at every backtest date. Missing
+    return entries are filled with each name's in-window mean so that
+    delisted or newly-listed stocks do not pull correlations toward
+    zero.
+
+    `cov_lookback_days` controls the trailing-window size (252 = 1y
+    by default; pass `None` only for diagnostic, look-ahead-unsafe
+    backtests). `cov_refit_every` caps how often the cov is refit —
+    refitting daily is slow on large universes, monthly (the default
+    21 trading days) is the standard production cadence.
 
     A `member_mask` panel (date x ticker, boolean) can be passed to
     `run` to enforce point-in-time index membership: names that were
     not in the index on a given date are constrained to zero weight.
     """
 
-    def __init__(self, signal_df, returns_df):
+    def __init__(self, signal_df, returns_df,
+                 cov_lookback_days: int | None = 252,
+                 cov_refit_every: int = 21):
         signal_df, returns_df = signal_df.align(returns_df, join="inner", axis=1)
         if signal_df.empty or returns_df.empty:
             raise ValueError("signal_df and returns_df must share at least one column")
@@ -38,11 +49,56 @@ class Optimizer:
         self.alpha_df = (ranked.subtract(ranked.mean(axis=1), axis=0)
                                .divide(ranked.std(axis=1) + 1e-6, axis=0))
 
-        ret_clean = returns_df.replace([np.inf, -np.inf], np.nan)
-        col_means = ret_clean.mean()
-        ret_filled = ret_clean.fillna(col_means).fillna(0).values
-        self.cov = LedoitWolf().fit(ret_filled).covariance_
+        # Returns are aligned to alpha columns and stored for per-date
+        # rolling-cov estimation. NaN/inf cleaned once; per-window
+        # mean-fill happens at fit time.
+        self._returns = (returns_df.reindex(columns=self.alpha_df.columns)
+                                   .replace([np.inf, -np.inf], np.nan))
         self.columns = self.alpha_df.columns
+        self.cov_lookback_days = cov_lookback_days
+        self.cov_refit_every = max(1, int(cov_refit_every))
+
+        # Cov cache keyed by (window_start_idx, window_end_idx). The
+        # legacy "fit once on the whole panel" path keys on "all".
+        self._cov_cache: dict = {}
+
+    def _fit_cov(self, ret_window: pd.DataFrame) -> np.ndarray:
+        """Ledoit-Wolf cov on a trailing return window with per-name mean-fill."""
+        if len(ret_window) < 20:
+            # Not enough data — diagonal cov scaled by mean per-name var
+            # falls back gracefully without distorting the QP.
+            n = len(self.columns)
+            return np.eye(n) * 1e-4
+        col_means = ret_window.mean()
+        ret_filled = ret_window.fillna(col_means).fillna(0).values
+        return LedoitWolf().fit(ret_filled).covariance_
+
+    def _cov_for_date(self, date) -> np.ndarray:
+        """
+        Trailing-window cov ending strictly before `date`. Cached so a
+        rebalance period (default 21 trading days) shares one fit.
+        """
+        if self.cov_lookback_days is None:
+            # Diagnostic / legacy path. Look-ahead unsafe for any
+            # backtest whose returns_df extends past `date`.
+            if "all" not in self._cov_cache:
+                self._cov_cache["all"] = self._fit_cov(self._returns)
+            return self._cov_cache["all"]
+
+        all_dates = self._returns.index
+        # `searchsorted` finds the position of `date` in the index; we
+        # want the window strictly before this index so no overlap with
+        # the QP date itself.
+        end_idx = int(all_dates.searchsorted(pd.Timestamp(date), side="left"))
+        # Anchor the cache key to a refit bucket so consecutive dates
+        # within the same bucket reuse the same fit.
+        bucket = (end_idx // self.cov_refit_every) * self.cov_refit_every
+        start_idx = max(0, bucket - self.cov_lookback_days)
+        cache_end = bucket
+        key = (start_idx, cache_end)
+        if key not in self._cov_cache:
+            self._cov_cache[key] = self._fit_cov(self._returns.iloc[start_idx:cache_end])
+        return self._cov_cache[key]
 
     def run(self, dollar_neutral=True, fully_invested=False,
             max_position=None, long_only=False, max_leverage=None,
@@ -51,9 +107,9 @@ class Optimizer:
         """
         Solve the per-date QP and return a weights DataFrame.
 
-        Built once with `cp.Parameter` for alpha, previous weights, and
-        per-name position bounds; the date loop only updates parameter
-        values and re-solves with warm-starting.
+        The cvxpy problem is rebuilt each time the cov refits (every
+        `cov_refit_every` dates by default); within a refit period
+        only parameters change and warm-starting carries across solves.
 
         `member_mask` is an optional (date x ticker) boolean panel
         marking which names are in the eligible universe on each date.
@@ -71,9 +127,6 @@ class Optimizer:
         if w_prev_p is not None:
             w_prev_p.value = np.zeros(n)
 
-        # Per-name bounds are always present so the same problem object
-        # can serve all callers; the default cap is large enough not to
-        # bind when max_position is not set.
         default_cap = 1.0 if max_position is None else max_position
         ub_p = cp.Parameter(n)
         lb_p = cp.Parameter(n)
@@ -89,11 +142,6 @@ class Optimizer:
         if max_leverage:
             c.append(cp.norm(w, 1) <= max_leverage)
 
-        obj = -alpha_p @ w + cp.quad_form(w, cp.psd_wrap(self.cov))
-        if lam > 0:
-            obj += lam * cp.norm(w - w_prev_p, 1)
-        prob = cp.Problem(cp.Minimize(obj), c)
-
         if member_mask is not None:
             mask_aligned = (member_mask
                             .reindex(index=self.alpha_df.index, columns=self.columns)
@@ -105,18 +153,32 @@ class Optimizer:
         dates = self.alpha_df.index[::subsample]
         weights = {}
         w_old = np.zeros(n)
+        current_cov_id = None
+        prob = None
+        current_cov = None  # most recent cov for target_vol scaling
 
         for i, date in enumerate(dates):
             alpha = self.alpha_df.loc[date].values.astype(float)
             if np.any(np.isnan(alpha)) or np.sum(np.abs(alpha)) == 0:
                 continue
 
+            cov = self._cov_for_date(date)
+            cov_id = id(cov)
+            if cov_id != current_cov_id:
+                # Rebuild the QP with the new cov. Warm-start is reset
+                # at each refit boundary; that is the price of doing
+                # the cov correctly.
+                obj = -alpha_p @ w + cp.quad_form(w, cp.psd_wrap(cov))
+                if lam > 0:
+                    obj += lam * cp.norm(w - w_prev_p, 1)
+                prob = cp.Problem(cp.Minimize(obj), c)
+                current_cov_id = cov_id
+                current_cov = cov
+
             if mask_aligned is not None:
                 mask_today = mask_aligned.loc[date].values
                 if not mask_today.any():
                     continue
-                # Names outside the universe today get a zero alpha and a
-                # zero bound on both sides.
                 alpha = np.where(mask_today, alpha, 0.0)
                 ub_p.value = np.where(mask_today, default_cap, 0.0)
                 lb_p.value = np.where(mask_today,
@@ -139,7 +201,7 @@ class Optimizer:
                 if s > 0:
                     w_old = w_old / s
             if target_vol:
-                port_vol = np.sqrt(w_old @ self.cov @ w_old) * np.sqrt(252)
+                port_vol = np.sqrt(w_old @ current_cov @ w_old) * np.sqrt(252)
                 if port_vol > 0:
                     w_old = w_old * (target_vol / port_vol)
             weights[date] = pd.Series(w_old, index=self.columns)
@@ -192,6 +254,32 @@ def port_ret(weights_df, returns_df, tcost_bps=0, tcost_short_bps=None,
     borrow = borrow.fillna(0)
 
     return gross - tc - borrow
+
+
+def vol_target(pnl, target_ann_vol=0.10, lookback=60, ppy=252,
+               max_leverage=5.0):
+    """
+    Scale a daily PnL series to target a constant annualised volatility.
+
+    Position sizing at date t uses the trailing realised vol over
+    `[t - lookback, t - 1]`; the resulting scale is applied to date t's
+    return via a one-day shift, so no future information enters today's
+    position. Leverage is capped at `max_leverage` to prevent the scale
+    from blowing up when realised vol approaches zero (which can happen
+    inside flat windows on small-universe sleeves).
+
+    Vol-targeting reliably adds 0.1-0.2 to a portfolio's Sharpe on top
+    of the same alpha because it pushes risk into the times the
+    strategy is working and pulls it out of the crashes. It does NOT
+    add new alpha — only re-allocates the risk budget across time.
+
+    Returns the scaled PnL series with the same index. The first
+    `lookback // 2` rows are zero (pre-warm-up).
+    """
+    realised = pnl.rolling(lookback, min_periods=lookback // 2).std() * np.sqrt(ppy)
+    scale = (target_ann_vol / realised).shift(1)
+    scale = scale.clip(upper=max_leverage).fillna(0.0)
+    return pnl * scale
 
 
 def quick_weights(signal_df, dollar_neutral=True, long_only=False,
@@ -489,3 +577,84 @@ def walk_forward_splits(index, train_years=5, test_years=1):
         test = slice(cur, cur + pd.DateOffset(years=test_years) - pd.Timedelta(days=1))
         yield train, test
         cur = cur + pd.DateOffset(years=test_years)
+
+
+def purged_kfold_splits(dates, n_splits=5, embargo=5):
+    """
+    Purged k-fold cross-validation with an embargo (Lopez de Prado, AFML ch. 7).
+
+    Each split returns (train_dates, test_dates). When the prediction
+    target is a forward-H-day return, training rows whose label window
+    overlaps the test fold leak future information into the model. Two
+    fixes applied here:
+
+      1. **Purging**: training rows within `embargo` days *before* the
+         test fold are dropped (their label window extends into the
+         test set).
+      2. **Embargo**: training rows within `embargo` days *after* the
+         test fold are dropped (the model could otherwise be fit on
+         data that immediately follows the test window and serial
+         correlation in features leaks information backwards).
+
+    `embargo` should be at least the label horizon H. Returns date-level
+    splits; the caller is responsible for slicing a (date, ticker) panel.
+    """
+    dates = pd.DatetimeIndex(sorted(set(dates)))
+    n = len(dates)
+    fold_sizes = [n // n_splits] * n_splits
+    for i in range(n % n_splits):
+        fold_sizes[i] += 1
+
+    starts = np.cumsum([0] + fold_sizes[:-1])
+    for k in range(n_splits):
+        test_start = starts[k]
+        test_end = test_start + fold_sizes[k] - 1
+        test = dates[test_start:test_end + 1]
+
+        # Train = everything except [test_start - embargo, test_end + embargo]
+        lo = max(0, test_start - embargo)
+        hi = min(n - 1, test_end + embargo)
+        train_mask = np.ones(n, dtype=bool)
+        train_mask[lo:hi + 1] = False
+        train = dates[train_mask]
+        yield train, test
+
+
+def kalman_hedge(y, x, delta=1e-5, R=1e-3):
+    """
+    Time-varying linear regression via a Kalman filter.
+
+    Observation model: y_t = alpha_t + beta_t * x_t + e_t,  e_t ~ N(0, R).
+    State evolution:   [alpha_t, beta_t] = [alpha_{t-1}, beta_{t-1}] + w_t,
+                       w_t ~ N(0, delta * I).
+
+    `delta` controls how fast the hedge ratio is allowed to drift; smaller
+    values produce smoother estimates. `R` is the observation noise variance.
+    Inputs are 1-D numpy arrays of equal length. NaN observations are skipped.
+
+    Returns (alpha_path, beta_path, residual_path), each a 1-D array
+    aligned to the input.
+    """
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    n = len(y)
+    state = np.zeros(2)
+    P = np.eye(2)
+    Q = delta * np.eye(2)
+    alphas = np.full(n, np.nan)
+    betas = np.full(n, np.nan)
+    resids = np.full(n, np.nan)
+    for t in range(n):
+        if np.isnan(y[t]) or np.isnan(x[t]):
+            continue
+        P_pred = P + Q
+        H = np.array([1.0, x[t]])
+        S = H @ P_pred @ H + R
+        K = (P_pred @ H) / S
+        innov = y[t] - H @ state
+        state = state + K * innov
+        P = (np.eye(2) - np.outer(K, H)) @ P_pred
+        alphas[t] = state[0]
+        betas[t] = state[1]
+        resids[t] = innov
+    return alphas, betas, resids

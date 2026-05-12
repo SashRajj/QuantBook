@@ -1,0 +1,56 @@
+# Execution-layer configuration. Loaded by runner.py at the top of
+# every rebalance. Risk limits are read from here, not from code, so
+# they can be changed without a deploy.
+#
+# Conventions:
+#   - All percentages are fractions of equity (0.05 = 5%), not bps.
+#   - All times are UTC unless otherwise noted.
+
+broker:
+  type: paper                  # paper | alpaca_stub
+  starting_cash: 100000        # USD, paper-account size
+  # Per-order assumptions chosen to match the backtest cost model
+  # (`port_ret(tcost_bps=5)`), so live PaperBroker PnL is directly
+  # comparable to the research-side OOS numbers. Splitting 5 bps
+  # into slippage vs commission is presentation; what matters is
+  # the round-trip total = 2 * (slippage + commission) = 10 bps,
+  # the same hurdle the research applied.
+  slippage_bps: 4.0
+  commission_bps: 1.0
+
+strategy:
+  name: combined_equity        # which weights to load
+  # Notes:
+  #   - This is the IC-weighted combination of mean_reversion, momentum,
+  #     low_volatility from notebook 04. The OOS HAC t-stat is 0.16
+  #     (does not pass significance). Live trading this is a pipeline
+  #     demonstration, not an alpha bet.
+
+execution:
+  algo: market                 # market | twap | vwap
+  twap_slices: 8               # used if algo=twap
+  allow_fractional: false      # set true on brokers that support it (Alpaca yes)
+  min_order_notional: 1.0      # skip sub-$1 rebalances
+  feed_sla_seconds: 172800     # 48h - covers Friday-to-Monday
+  signal_half_life_bars: null  # null = no decay. Set to e.g. 10 to soft-scale
+                               # the signal when the freshest bar is older
+                               # than the rebalance cadence. Independent of
+                               # feed_sla_seconds, which is the hard kill.
+
+risk:
+  max_gross_leverage: 1.5      # |long| + |short| <= 1.5 * equity
+  max_net_exposure: 0.10       # |long - short| / equity
+  max_position_pct: 0.05       # any single |pos| / equity
+  max_positions: 200           # count of non-zero positions
+  max_adv_participation_pct: 0.05   # per order vs 20D ADV (null disables)
+  max_daily_turnover_pct: 2.0  # sum(|order_notional|) / equity
+  drawdown_kill_pct: 0.15      # exit if equity < HWM * (1 - 0.15)
+  blocked_symbols: []          # e.g. names under SEC investigation
+
+reconciliation:
+  price_divergence_threshold_pct: 5.0
+  qty_tolerance: 0.000001
+
+paths:
+  log_dir: logs                # audit journals land in logs/YYYY-MM-DD/journal.jsonl
+  weights_path: data/weights_combined_oos.parquet

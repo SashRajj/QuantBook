@@ -21,3 +21,10 @@ data/
 
 # OS
 .DS_Store
+
+# Execution-layer runtime artefacts
+logs/
+*.jsonl
+
+# Notebook re-run logs
+_rerun_logs/
