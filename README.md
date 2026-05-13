@@ -104,6 +104,17 @@ LightGBM (notebook 08) needs `pip install lightgbm`; on macOS also
 fixed in `download_sp500.py` (2005-01-01 → 2026-04-01) so outputs are
 reproducible.
 
+### C++ extension build
+
+The execution hot path (fill engine, bookkeeping, pre-trade risk) has
+an optional C++ core. Skip this and everything still runs on the
+pure-Python fallback. To enable it:
+
+```bash
+pip install pybind11
+pip install -e .
+```
+
 ## The three linear signals
 
 | Notebook | Signal | Hypothesis |

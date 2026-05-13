@@ -6,6 +6,10 @@ __pycache__/
 venv/
 .env
 
+# C++ extension build artefacts
+build/
+*.so
+
 # Notebook checkpoints
 .ipynb_checkpoints/
 

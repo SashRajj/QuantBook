@@ -41,6 +41,16 @@ import pandas as pd
 
 from execution import Account, Order
 
+# Optional C++ acceleration for the pre-trade gate. Same additive
+# optimisation pattern as execution.py: import-failure falls back to
+# the pure-Python implementation that lives below.
+try:
+    import qbexec_cpp as _qbexec_cpp  # noqa: F401
+    _HAS_CPP = True
+except ImportError:
+    _qbexec_cpp = None
+    _HAS_CPP = False
+
 
 @dataclass
 class RiskLimits:
@@ -93,9 +103,63 @@ class PreTradeRiskGate:
         Order of checks is fixed so failures are reproducible. Drawdown
         check fires first because it can hard-flat the book regardless
         of what the optimiser produced.
+
+        Hot-path: when the C++ extension is built, the entire check
+        loop runs in `qbexec_cpp.risk_check`. Numeric formatting in the
+        returned breach string may differ in a digit or two from the
+        pure-Python form (snprintf vs Python's `f"{x:g}"`), but the
+        order of checks, the substring keywords ("drawdown",
+        "gross leverage", "per-name", "blocked", ...) and the
+        all-clear-vs-breach decision are identical.
         """
         self.update_hwm(equity)
 
+        if _HAS_CPP:
+            return self._check_cpp(orders, account, prices, equity)
+        return self._check_python(orders, account, prices, equity)
+
+    # ------------------------------------------------------------------
+    # C++ delegate
+    # ------------------------------------------------------------------
+
+    def _check_cpp(self, orders: list[Order], account: Account,
+                   prices: dict[str, float], equity: float) -> str | None:
+        # Build a plain C++ limits struct from the dataclass. None
+        # fields stay as std::optional() i.e. disabled checks.
+        lim = _qbexec_cpp.RiskLimitsC()
+        lim.max_gross_leverage = self.limits.max_gross_leverage
+        lim.max_net_exposure = self.limits.max_net_exposure
+        lim.max_position_pct = self.limits.max_position_pct
+        lim.max_positions = self.limits.max_positions
+        lim.max_adv_participation_pct = self.limits.max_adv_participation_pct
+        lim.max_daily_turnover_pct = self.limits.max_daily_turnover_pct
+        lim.drawdown_kill_pct = self.limits.drawdown_kill_pct
+        lim.blocked_symbols = set(self.limits.blocked_symbols)
+        lim.strict_adv = self.limits.strict_adv
+
+        cpp_orders = [
+            _qbexec_cpp.OrderView(o.symbol, float(o.qty)) for o in orders
+        ]
+        current = {sym: float(pos.qty)
+                   for sym, pos in account.positions.items()}
+
+        breach = _qbexec_cpp.risk_check(
+            cpp_orders,
+            current,
+            {k: float(v) for k, v in prices.items()},
+            float(equity),
+            self._hwm,
+            {k: float(v) for k, v in self._adv.items()},
+            lim,
+        )
+        return breach if breach else None
+
+    # ------------------------------------------------------------------
+    # Pure-Python fallback (also the numeric reference for the C++ port)
+    # ------------------------------------------------------------------
+
+    def _check_python(self, orders: list[Order], account: Account,
+                      prices: dict[str, float], equity: float) -> str | None:
         # Drawdown kill switch.
         if (self._hwm is not None and self._hwm > 0
                 and self.limits.drawdown_kill_pct is not None):

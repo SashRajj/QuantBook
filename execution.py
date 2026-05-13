@@ -41,6 +41,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# Optional C++ acceleration. The extension is a strict additive
+# optimisation: if it is not built (e.g. fresh checkout, no compiler),
+# we silently fall back to the pure-Python bookkeeper below. Both paths
+# are numerically identical to the precision the tests require.
+try:
+    import qbexec_cpp as _qbexec_cpp  # noqa: F401
+    _HAS_CPP = True
+except ImportError:
+    _qbexec_cpp = None
+    _HAS_CPP = False
+
 
 # ---------------------------------------------------------------------------
 # Enums and primitives
@@ -236,6 +247,123 @@ class Broker(abc.ABC):
     def cancel_order(self, order_id: str) -> None: ...
 
 
+class _PyBookkeeper:
+    """
+    Pure-Python reference implementation of the fill engine.
+
+    This is the fallback used when the `qbexec_cpp` extension is not
+    built. It is also the canonical reference for what the C++ side
+    must reproduce numerically. Methods deliberately mirror the names
+    on `qbexec_cpp.PaperBookkeeper`, so `PaperBroker` can hold either
+    object behind a uniform interface.
+    """
+
+    def __init__(self, starting_cash: float, slippage_bps: float,
+                 commission_bps: float, fill_ratio: float):
+        if not (0 < fill_ratio <= 1):
+            raise ValueError("fill_ratio must be in (0, 1]")
+        self._starting_cash = starting_cash
+        self._slippage_bps = slippage_bps
+        self._commission_bps = commission_bps
+        self._fill_ratio = fill_ratio
+        self._cash = starting_cash
+        self._realized_pnl = 0.0
+        self._total_commissions = 0.0
+        self._positions: dict[str, tuple[float, float]] = {}  # symbol -> (qty, avg_price)
+        self._prices: dict[str, float] = {}
+
+    def update_prices(self, prices: dict[str, float]) -> None:
+        self._prices.update(prices)
+
+    def has_price(self, symbol: str) -> bool:
+        return symbol in self._prices
+
+    def last_price(self, symbol: str) -> float:
+        if symbol not in self._prices:
+            raise KeyError(f"no price for {symbol}; call update_prices first")
+        return self._prices[symbol]
+
+    def simulate_and_apply(self, symbol: str, order_qty: float):
+        fill_qty = order_qty * self._fill_ratio
+        px = self.last_price(symbol)
+        slip = self._slippage_bps / 1e4 * (1 if fill_qty > 0 else -1)
+        fill_px = px * (1 + slip)
+        notional = abs(fill_qty) * fill_px
+        commission = notional * self._commission_bps / 1e4
+        self.apply_fill(symbol, fill_qty, fill_px, commission)
+        return _FillResultPy(fill_qty, fill_px, commission)
+
+    def apply_fill(self, symbol: str, qty: float, price: float,
+                   commission: float) -> None:
+        # Four-branch position-transition logic. See the class docstring
+        # in PaperBroker for the full rationale; the short version is
+        # that a naive two-branch (same-direction-or-not) form corrupts
+        # cost basis on partial closes.
+        existing = self._positions.get(symbol)
+
+        if existing is None:
+            self._positions[symbol] = (qty, price)
+        else:
+            pos_qty, pos_avg = existing
+            same_direction = pos_qty * qty > 0
+            new_qty = pos_qty + qty
+
+            if same_direction:
+                new_avg = (pos_avg * pos_qty + price * qty) / new_qty
+                self._positions[symbol] = (new_qty, new_avg)
+            else:
+                full_close_or_flip = abs(qty) >= abs(pos_qty)
+                closed_qty = pos_qty if full_close_or_flip else -qty
+                self._realized_pnl += closed_qty * (price - pos_avg)
+
+                if full_close_or_flip:
+                    if new_qty == 0:
+                        del self._positions[symbol]
+                    else:
+                        self._positions[symbol] = (new_qty, price)
+                else:
+                    self._positions[symbol] = (new_qty, pos_avg)
+
+        self._cash -= qty * price + commission
+        self._total_commissions += commission
+
+    def cash(self) -> float: return self._cash
+    def realized_pnl(self) -> float: return self._realized_pnl
+    def total_commissions(self) -> float: return self._total_commissions
+    def starting_cash(self) -> float: return self._starting_cash
+    def slippage_bps(self) -> float: return self._slippage_bps
+    def commission_bps(self) -> float: return self._commission_bps
+    def fill_ratio(self) -> float: return self._fill_ratio
+
+    def has_position(self, symbol: str) -> bool:
+        return symbol in self._positions
+
+    def get_position(self, symbol: str):
+        qty, avg = self._positions[symbol]
+        return _PositionRecordPy(qty, avg)
+
+    def all_positions(self):
+        return [(s, _PositionRecordPy(q, a))
+                for s, (q, a) in self._positions.items()]
+
+
+class _PositionRecordPy:
+    __slots__ = ("qty", "avg_price")
+
+    def __init__(self, qty: float, avg_price: float):
+        self.qty = qty
+        self.avg_price = avg_price
+
+
+class _FillResultPy:
+    __slots__ = ("fill_qty", "fill_price", "commission")
+
+    def __init__(self, fill_qty: float, fill_price: float, commission: float):
+        self.fill_qty = fill_qty
+        self.fill_price = fill_price
+        self.commission = commission
+
+
 class PaperBroker(Broker):
     """
     Simulated broker that fills orders against an in-memory price feed.
@@ -252,6 +380,11 @@ class PaperBroker(Broker):
         cash + mark_to_market(positions) + commissions == starting_cash
     holds to floating-point tolerance. (Realised PnL is *already*
     reflected in `cash`, so adding it would double-count.)
+
+    The hot path (fill simulation + bookkeeping) is delegated to the
+    C++ extension `qbexec_cpp` when available, and falls back to an
+    equivalent pure-Python implementation otherwise. The two paths are
+    numerically identical to the precision the tests require.
     """
 
     def __init__(self, starting_cash: float = 100_000.0,
@@ -259,26 +392,47 @@ class PaperBroker(Broker):
                  fill_ratio: float = 1.0):
         if not (0 < fill_ratio <= 1):
             raise ValueError("fill_ratio must be in (0, 1]")
-        self._account = Account(cash=starting_cash)
-        self._prices: dict[str, float] = {}
-        self._slippage_bps = slippage_bps
-        self._commission_bps = commission_bps
-        self._fill_ratio = fill_ratio
+        if _HAS_CPP:
+            self._book = _qbexec_cpp.PaperBookkeeper(
+                starting_cash, slippage_bps, commission_bps, fill_ratio,
+            )
+        else:
+            self._book = _PyBookkeeper(
+                starting_cash, slippage_bps, commission_bps, fill_ratio,
+            )
         self._fills: list[Fill] = []
         self._orders_by_id: dict[str, Order] = {}
         self._orders_by_client_id: dict[str, str] = {}
         self._next_order_id = 1
 
     def update_prices(self, prices: dict[str, float]) -> None:
-        self._prices.update(prices)
+        self._book.update_prices(prices)
 
     def get_account(self) -> Account:
-        return self._account
+        """
+        Materialise an `Account` view over the C++/Python bookkeeper.
+
+        The returned object is a fresh snapshot. Tests and the
+        `rebalance` entry point treat `Account` as read-only; if a
+        caller mutates it, the changes are not propagated back into
+        the bookkeeper. This matches the previous Python-only behaviour
+        because the prior `_account` field *was* the bookkeeper.
+        """
+        positions: dict[str, Position] = {}
+        for sym, rec in self._book.all_positions():
+            positions[sym] = Position(symbol=sym, qty=rec.qty,
+                                      avg_price=rec.avg_price)
+        return Account(cash=self._book.cash(),
+                       positions=positions,
+                       realized_pnl=self._book.realized_pnl())
 
     def last_price(self, symbol: str) -> float:
-        if symbol not in self._prices:
+        # The C++ bookkeeper raises std::out_of_range, which pybind11
+        # surfaces as IndexError; the Python fallback raises KeyError.
+        # Normalise to KeyError so callers see one contract.
+        if not self._book.has_price(symbol):
             raise KeyError(f"no price for {symbol}; call update_prices first")
-        return self._prices[symbol]
+        return self._book.last_price(symbol)
 
     def submit_order(self, order: Order) -> str:
         # Idempotency: a retry with the same client_id and matching qty
@@ -310,86 +464,24 @@ class PaperBroker(Broker):
         self._orders_by_id[order_id] = order
         self._orders_by_client_id[order.client_id] = order_id
 
-        fill_qty = order.qty * self._fill_ratio
-        px = self.last_price(order.symbol)
-        slip = self._slippage_bps / 1e4 * (1 if fill_qty > 0 else -1)
-        fill_px = px * (1 + slip)
-        notional = abs(fill_qty) * fill_px
-        commission = notional * self._commission_bps / 1e4
+        # Delegate fill pricing + position update to the bookkeeper
+        # (C++ or Python). The Order object's own filled_qty /
+        # avg_fill_price / status fields are still owned here, so
+        # tests that read those fields keep working unchanged.
+        # Pre-check the price so the bookkeeper's missing-price
+        # exception (KeyError in Python, IndexError in C++) surfaces
+        # as a single KeyError contract.
+        if not self._book.has_price(order.symbol):
+            raise KeyError(
+                f"no price for {order.symbol}; call update_prices first")
+        result = self._book.simulate_and_apply(order.symbol, order.qty)
 
-        self._apply_fill(order, fill_qty, fill_px, commission)
-
-        if abs(order.filled_qty) >= abs(order.qty) - 1e-9:
-            order.status = OrderStatus.FILLED
-        else:
-            order.status = OrderStatus.PARTIALLY_FILLED
-
-        return order_id
-
-    def _apply_fill(self, order: Order, qty: float, price: float,
-                    commission: float) -> None:
-        """
-        Update positions, cash, and realised PnL for one fill.
-
-        Four position-transition cases, in mutually exclusive branches:
-
-          * Open: no prior position.
-          * Add: same-side increase. Weighted-average the basis.
-          * Reduce (partial close): opposite side, smaller than the
-            existing position. Realise PnL on the closed portion;
-            basis on the remaining shares is unchanged.
-          * Flatten / flip: opposite side, equal to or larger than the
-            existing position. Realise PnL on the closed portion; if
-            anything is left over, that's a new position at the fill
-            price.
-
-        The four-branch form below is what every textbook ledger uses;
-        the test suite covers each branch (open, add, partial-close,
-        full-close-or-flip) for both long and short sides. The trap to
-        avoid: a "same-direction" check via `pos.qty * new_qty > 0`
-        stays positive on a partial close, so a naive two-branch form
-        silently corrupts the cost basis on every interim reduction.
-        """
-        pos = self._account.positions.get(order.symbol)
-
-        if pos is None:
-            self._account.positions[order.symbol] = Position(
-                symbol=order.symbol, qty=qty, avg_price=price,
-            )
-        else:
-            same_direction = pos.qty * qty > 0
-            new_qty = pos.qty + qty
-
-            if same_direction:
-                # Add to existing position. Sign-agnostic weighted average:
-                # for shorts the signs cancel through the division.
-                pos.avg_price = (pos.avg_price * pos.qty + price * qty) / new_qty
-                pos.qty = new_qty
-            else:
-                # Opposite direction: close some or all of the position.
-                # `closed_qty` is the signed quantity of the closed
-                # portion (carries the sign of pos.qty), so
-                # `closed_qty * (price - avg_price)` is correctly signed
-                # for both long-closes and short-covers.
-                full_close_or_flip = abs(qty) >= abs(pos.qty)
-                closed_qty = pos.qty if full_close_or_flip else -qty
-                self._account.realized_pnl += closed_qty * (price - pos.avg_price)
-
-                if full_close_or_flip:
-                    if new_qty == 0:
-                        del self._account.positions[order.symbol]
-                    else:
-                        pos.qty = new_qty
-                        pos.avg_price = price   # flipped side's new basis
-                else:
-                    # Partial close: keep avg_price, just reduce qty.
-                    pos.qty = new_qty
-
-        self._account.cash -= qty * price + commission
+        qty = result.fill_qty
+        price = result.fill_price
+        commission = result.commission
 
         order.filled_qty += qty
-        # Avg fill price is the qty-weighted average across all fills
-        # for this order id.
+        # Quantity-weighted average across all fills for this order id.
         if order.avg_fill_price == 0.0:
             order.avg_fill_price = price
         else:
@@ -404,6 +496,13 @@ class PaperBroker(Broker):
             timestamp=utcnow(), order_id=order.broker_order_id,
             client_id=order.client_id, commission=commission,
         ))
+
+        if abs(order.filled_qty) >= abs(order.qty) - 1e-9:
+            order.status = OrderStatus.FILLED
+        else:
+            order.status = OrderStatus.PARTIALLY_FILLED
+
+        return order_id
 
     def cancel_order(self, order_id: str) -> None:
         order = self._orders_by_id.get(order_id)

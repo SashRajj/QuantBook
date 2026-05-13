@@ -1,0 +1,7 @@
+# Minimal pyproject.toml so pip's isolated build environment knows it
+# needs pybind11 before invoking setup.py. The actual package metadata
+# is still in setup.py to keep this terse.
+
+[build-system]
+requires = ["setuptools>=64", "wheel", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
